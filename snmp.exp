@@ -1,0 +1,108 @@
+#!/usr/bin/expect -f
+
+#exp_internal 1
+set force_conservative 1  ;# set to 1 to force conservative mode even if
+                          ;# script wasn't run conservatively originally
+if {$force_conservative} {
+        set send_slow {1 .1}
+        proc send {ignore arg} {
+                sleep .1
+                exp_send -s -- $arg
+        }
+}
+
+log_user 0
+
+set HOSTNAME [lindex $argv 0]
+set DEVID [lindex $argv 1]
+set timeout 2
+
+set auth [exec /usr/bin/pwgen -cns 15 1]
+set priv [exec /usr/bin/pwgen -cns 15 1]
+set user "SNMP-V3"
+set sqlpass "x"
+set sqlquery "UPDATE devices SET snmpver = 'v3', authname = '$user', authlevel = 'authPriv', authalgo = 'SHA', authpass = '$auth', cryptopass = '$priv', cryptoalgo = 'AES-256-C'  WHERE device_id = $DEVID"
+set devicepass "x"
+
+puts "\r\[-\] Starting switch SNMP reconfiguration for $HOSTNAME as LibreNMS device $DEVID\r"
+puts "\r\[-\] Using $user for username\r"
+puts "\r\[-\] Using $auth for authentication\r"
+puts "\r\[-\] Using $priv for privilege\r"
+
+
+spawn ssh -l admin $HOSTNAME
+match_max 100000
+
+expect {
+  -re "(.*)Connection timed out(.*)" {
+    puts "SSH Failed"
+    close
+    exit
+  }
+}
+
+expect "assword:"
+send -- "$devicepass\r"
+puts "\[+\] SSH Password send"
+
+expect -re "(.*)#$"
+
+puts "\[+\] Fetching pre-existing communities"
+send -- "show running-config | i snmp-server community\r"
+
+expect -re "(.*)#$"
+
+set lines [split $expect_out(buffer) \n]
+foreach line $lines {
+  #puts "line: $line"
+  if { [string match "snmp-server community*" $line] } {
+    set commsplit [split $line " "]
+    set community [lindex $commsplit 2]
+    send -- "configure terminal\r"
+    expect -re "(.*)(config)#$"
+    puts "\r\[-\] Removing community $community"
+    send -- "no snmp-server community $community\r"
+    expect -re "(.*)(config)#$"
+    send -- "exit\r"
+    expect -re "(.*)#$"
+  }
+}
+
+puts "\[-\] Removing SNMP traps"
+send -- "configure terminal\r"
+expect -re "(.*)(config)#$"
+send -- "no snmp-server enable traps\r"
+expect -re "(.*)(config)#$"
+send -- "exit\r"
+expect -re "(.*)#$"
+
+puts "\[+\] Creating SNMPv3 Configuration"
+send -- "configure terminal\r"
+expect -re "(.*)(config)#$"
+
+puts "\[+\] Creating SNMPv3 view"
+send -- "snmp-server view snmp-v3-ReadOnly-View iso included\r"
+expect -re "(.*)(config)#$"
+puts "\[+\] Creating SNMPv3 group"
+send -- "snmp-server group snmp-v3-ReadOnly v3 priv read snmp-v3-ReadOnly-View access snmp-service\r"
+expect -re "(.*)(config)#$"
+
+puts "\[+\] Creating SNMPv3 user"
+send -- "snmp-server user $user snmp-v3-ReadOnly v3 auth sha $auth priv aes 256 $priv access snmp-service\r"
+
+puts "\[+\] Exit configure mode"
+expect -re "(.*)(config)#$"
+send -- "exit\r"
+
+expect -re "(.*)#$"
+puts "\[+\] Saving configuration"
+send -- "wr mem\r"
+expect -re "(.*)#$"
+
+puts "\[!\] Reconfiguring Libre with $user and auth $auth and priv $priv for SNMPv3"
+set librenms [exec /usr/bin/mysql -ulibrenms -p$sqlpass librenms -e $sqlquery ]
+
+puts "\[!\] My work here is done."
+
+close
+exit
